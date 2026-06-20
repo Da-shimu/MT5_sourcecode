@@ -1,0 +1,309 @@
+//+------------------------------------------------------------------+
+//|                               HighFreq_Reboot_M5_VolumeOptimizer.mq5 |
+//|                                  Copyright 2026, MetaQuotes Ltd. |
+//+------------------------------------------------------------------+
+/*
+【EA概要説明】
+ 200EMA（指数平滑移動平均線）で大局のトレンド方向を識別し、
+ MACDのクロスをトリガーに5分足（M5）レンジで短期スキャルピングを行うトレンドフォロー型EAです。
+ 
+【エントリーロジック】
+ ・買い条件：
+   1. 前回の確定足終値が200EMAより上にあること
+   2. 200EMAの傾き（指定バー数前との差）が設定値（MinSlopePips）以上で右肩上がりであること
+   3. MACDメイン線がシグナル線を下から上に突き抜けたこと（ゴールデンクロス）
+ ・売り条件：
+   1. 前回の確定足終値が200EMAより下にあること
+   2. 200EMAの傾きが設定値以下で右肩下がりであること
+   3. MACDメイン線がシグナル線を上から下に突き抜けたこと（デッドクロス）
+
+【安全機能・フィルター】
+ 1. 時間帯フィルター（指定したサーバー時間内のみエントリーを許可）
+ 2. 資金管理ロジック（口座残高に対する許容リスク%から、損切幅を考慮して適正ロット数を自動計算）
+ 3. 当日強制決済機能（塩漬け防止用タイムアウト：指定時間になったら未決済ポジションを強制クリア）
+ 4. 週末強制決済機能（週跨ぎリスク回避：金曜夜の指定時間以降、全決済および新規注文のシャットアウト）
+*/
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2026, MetaQuotes Ltd."
+#property version   "2.70"
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+// --- パラメータ設定 ---
+// 💰【資金管理（オートロット）設定】
+input bool   AutoLots = true;        // 口座残高からロットを自動計算する(複利)
+input double RiskPercent = 2.0;      // 1トレードあたりの許容リスク (%) ※AutoLots=true時
+input double FixedLots = 1.0;        // 固定ロット数 ※AutoLots=false時
+
+input int    FilterEMAPeriod = 120;  // 大局フィルター
+input int    MACDFast = 3;           // MACD 短期EMA
+input int    MACDSlow = 88;          // MACD 長期EMA
+input int    MACDSignal = 9;         // MACD シグナル
+
+// ★【エントリー頻度コントロールの鍵】
+input int    SlopeBarShift = 12;      // 傾きを判定する過去のバー数
+input double MinSlopePips = 0.0;     // 必要な傾き（Pips）
+
+// ⏰【時間帯フィルター】
+input bool   UseTimeFilter = true;   // 時間帯フィルターを使用する
+input int    StartHour = 6;          // エントリー開始時間 (サーバー時間)
+input int    EndHour = 14;           // エントリー終了時間 (サーバー時間)
+
+// ⏳ / 📅【決済・タイムアウトフィルター】
+input bool   UseForcedClose = false;  // 当日強制決済機能を使用する
+input int    ForcedCloseHour = 23;   // 強制決済を行う時間 (サーバー時間)
+
+input bool   UseWeekendClose = true; // 金曜日の週末強制決済機能を使用する (超推奨)
+input int    WeekendCloseHour = 22;  // 金曜日に強制決済を行う時間 (サーバー時間)
+
+// --- 決済設定 ---
+input double TakeProfitPips = 25.0;  // 固定利確幅
+input double StopLossPips = 28.0;    // 固定損切幅
+
+int handle_ema200;
+int handle_macd;
+ulong magicNumber = 888888;
+
+void ExecuteOrder(ENUM_ORDER_TYPE type);
+void CheckForcedClose();
+void CheckWeekendClose();
+double CalculateLots();
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(magicNumber);
+
+   handle_ema200 = iMA(_Symbol, PERIOD_M5, FilterEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   handle_macd = iMACD(_Symbol, PERIOD_M5, MACDFast, MACDSlow, MACDSignal, PRICE_CLOSE);
+
+   if(handle_ema200 == INVALID_HANDLE || handle_macd == INVALID_HANDLE)
+   {
+      Print("インジケーターの初期化に失敗しました。");
+      return(INIT_FAILED);
+   }
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(handle_ema200);
+   IndicatorRelease(handle_macd);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   MqlDateTime str_time;
+   TimeToStruct(TimeCurrent(), str_time);
+
+   // --- 📅 週末強制決済のチェック（最優先） ---
+   if(UseWeekendClose && str_time.day_of_week == 5 && PositionsTotal() > 0)
+   {
+      CheckWeekendClose();
+   }
+
+   // --- ⏳ 当日強制決済のチェック ---
+   if(UseForcedClose && PositionsTotal() > 0)
+   {
+      CheckForcedClose();
+   }
+
+   // 金曜日の週末決済時間を過ぎている場合は、新規エントリーを禁止して終了
+   if(UseWeekendClose && str_time.day_of_week == 5 && str_time.hour >= WeekendCloseHour)
+   {
+      return;
+   }
+
+   if(PositionsTotal() > 0) return;
+
+   static datetime lastBarTime;
+   datetime currentBarTime = iTime(_Symbol, PERIOD_M5, 0);
+   if(lastBarTime == currentBarTime) return; 
+
+   // --- 時間帯フィルターの判定 ---
+   if(UseTimeFilter)
+   {
+      int current_hour = str_time.hour;
+      bool is_time_allowed = false;
+
+      if(StartHour <= EndHour)
+      {
+         if(current_hour >= StartHour && current_hour <= EndHour) is_time_allowed = true;
+      }
+      else
+      {
+         if(current_hour >= StartHour || current_hour <= EndHour) is_time_allowed = true;
+      }
+
+      if(!is_time_allowed) return;
+   }
+
+   // 動的配列として宣言
+   double ema200[];
+   double macdMain[], macdSignal[];
+   
+   if(CopyBuffer(handle_ema200, 0, 1, SlopeBarShift + 1, ema200) <= 0) return;
+   if(CopyBuffer(handle_macd, 0, 1, 3, macdMain) <= 0) return; 
+   if(CopyBuffer(handle_macd, 1, 1, 3, macdSignal) <= 0) return; 
+
+   ArraySetAsSeries(ema200, true);
+   ArraySetAsSeries(macdMain, true);
+   ArraySetAsSeries(macdSignal, true);
+
+   double closePrice = iClose(_Symbol, PERIOD_M5, 1);
+
+   double mainCur = macdMain[0];
+   double mainPre = macdMain[1];
+   double sigCur = macdSignal[0];
+   double sigPre = macdSignal[1];
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0; 
+
+   double emaCur = ema200[0];
+   double emaOld = ema200[SlopeBarShift];
+   double emaSlopePips = (emaCur - emaOld) / (pipMultiplier * point);
+
+   // --- エントリーロジック ---
+   if(closePrice > emaCur && emaSlopePips >= MinSlopePips)
+   {
+      if(mainPre <= sigPre && mainCur > sigCur) 
+      {
+         lastBarTime = currentBarTime;
+         ExecuteOrder(ORDER_TYPE_BUY);
+      }
+   }
+   else if(closePrice < emaCur && emaSlopePips <= -MinSlopePips)
+   {
+      if(mainPre >= sigPre && mainCur < sigCur) 
+      {
+         lastBarTime = currentBarTime;
+         ExecuteOrder(ORDER_TYPE_SELL);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 注文実行用補助関数                                               |
+//+------------------------------------------------------------------+
+void ExecuteOrder(ENUM_ORDER_TYPE type)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0; 
+   
+   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl = 0, tp = 0;
+
+   // ロット数の動的計算の呼び出し
+   double calculatedLots = CalculateLots();
+   if(calculatedLots <= 0) return;
+
+   if(type == ORDER_TYPE_BUY)
+   {
+      sl = price - (StopLossPips * pipMultiplier * point);
+      tp = price + (TakeProfitPips * pipMultiplier * point);
+      trade.Buy(calculatedLots, _Symbol, price, sl, tp, "Slope_Buy");
+   }
+   else if(type == ORDER_TYPE_SELL)
+   {
+      sl = price + (StopLossPips * pipMultiplier * point);
+      tp = price - (TakeProfitPips * pipMultiplier * point);
+      trade.Sell(calculatedLots, _Symbol, price, sl, tp, "Slope_Sell");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 当日強制決済用チェック関数                                       |
+//+------------------------------------------------------------------+
+void CheckForcedClose()
+{
+   MqlDateTime str_time;
+   TimeToStruct(TimeCurrent(), str_time);
+   
+   if(str_time.hour == ForcedCloseHour)
+   {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0)
+         {
+            if(PositionGetInteger(POSITION_MAGIC) == magicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               trade.PositionClose(ticket);
+               Print("【時間決済】指定時間になったため、ポジションを強制決済しました。");
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 📅 週末（金曜日）強制決済用チェック関数                         |
+//+------------------------------------------------------------------+
+void CheckWeekendClose()
+{
+   MqlDateTime str_time;
+   TimeToStruct(TimeCurrent(), str_time);
+   
+   // 金曜日（5）かつ 設定された週末決済時間に達したら強制決済
+   if(str_time.day_of_week == 5 && str_time.hour >= WeekendCloseHour)
+   {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket > 0)
+         {
+            if(PositionGetInteger(POSITION_MAGIC) == magicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               trade.PositionClose(ticket);
+               Print("【週末決済】金曜日の閉場が近づいたため、ポジション（チケット番号: ", ticket, "）を週末強制クローズしました。");
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ロット数自動計算関数（資金管理ロジック）                         |
+//+------------------------------------------------------------------+
+double CalculateLots()
+{
+   if(!AutoLots) return FixedLots;
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double maxLossAmount = balance * (RiskPercent / 100.0);
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize == 0) return FixedLots;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pipMultiplier = (digits == 3 || digits == 5) ? 10.0 : 1.0; 
+
+   double slPoints = StopLossPips * pipMultiplier * point;
+
+   double lossPerLot = (slPoints / tickSize) * tickValue;
+   if(lossPerLot == 0) return FixedLots;
+
+   double calculatedLots = maxLossAmount / lossPerLot;
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   calculatedLots = MathFloor(calculatedLots / stepLot) * stepLot;
+
+   if(calculatedLots < minLot) calculatedLots = minLot;
+   if(calculatedLots > maxLot) calculatedLots = maxLot;
+
+   return calculatedLots;
+}
