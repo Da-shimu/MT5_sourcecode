@@ -1,0 +1,272 @@
+//+------------------------------------------------------------------+
+//|                                                         test.mq5 |
+//|                                  Copyright 2026, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2026, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+
+// --- MQL5の標準取引ライブラリ ---
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+// --- 共通パラメータ ---
+input double Lots_H1 = 0.1;  // ロジック1(H1)用ロット
+input double Lots_M30 = 0.5; // ロジック2(M30)用ロット
+input double TakeProfit = 450; 
+input double StopLoss = 200;   
+
+// --- 時間管理・リスク管理 ---
+input int MaxLossCountPerDay = 1; 
+input int WaitHoursAfterLoss = 8; 
+input int StartHourMonday = 10;   
+input int FridayCloseHour = 22;   
+input bool UseMonthlyFilter = true;
+
+// --- 指標用定数 ---
+input int FastMA = 12;
+input int SlowMA = 36;
+input int RSIPeriod = 14;
+
+// --- インジケーターハンドル（MQL5専用） ---
+int handle_rsi_h1, handle_maFast_h1, handle_maSlow_h1;
+int handle_rsi_m30, handle_maFast_m30, handle_maSlow_m30;
+int handle_maMid, handle_maLong;
+
+// --- 前方宣言 ---
+void ExecuteLogicH1();
+void ExecuteLogicM30();
+void ExecuteOrder(ENUM_ORDER_TYPE type, double lots, string comment);
+int GetDailyLossCount();
+bool IsWaitTimeActive(int waitHours);
+void CloseAllPositions();
+double GetIndiValue(int handle, int shift);
+int GetDayOfWeek();
+int GetHour();
+int GetMonth();
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // マジックナンバーの設定
+   trade.SetExpertMagicNumber(123456);
+
+   // H1用インジケーターの初期化
+   handle_rsi_h1    = iRSI(_Symbol, PERIOD_H1, RSIPeriod, PRICE_CLOSE);
+   handle_maFast_h1 = iMA(_Symbol, PERIOD_H1, FastMA, 0, MODE_EMA, PRICE_CLOSE);
+   handle_maSlow_h1 = iMA(_Symbol, PERIOD_H1, SlowMA, 0, MODE_SMA, PRICE_CLOSE);
+
+   // M30用インジケーターの初期化
+   handle_rsi_m30    = iRSI(_Symbol, PERIOD_M30, RSIPeriod, PRICE_CLOSE);
+   handle_maFast_m30 = iMA(_Symbol, PERIOD_M30, FastMA, 0, MODE_EMA, PRICE_CLOSE);
+   handle_maSlow_m30 = iMA(_Symbol, PERIOD_M30, SlowMA, 0, MODE_SMA, PRICE_CLOSE);
+
+   // MTF用インジケーターの初期化
+   handle_maMid  = iMA(_Symbol, PERIOD_H1, 20, 0, MODE_SMA, PRICE_CLOSE);
+   handle_maLong = iMA(_Symbol, PERIOD_H4, 20, 0, MODE_SMA, PRICE_CLOSE);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // メモリ解放（ハンドルの削除）
+   IndicatorRelease(handle_rsi_h1);
+   IndicatorRelease(handle_maFast_h1);
+   IndicatorRelease(handle_maSlow_h1);
+   IndicatorRelease(handle_rsi_m30);
+   IndicatorRelease(handle_maFast_m30);
+   IndicatorRelease(handle_maSlow_m30);
+   IndicatorRelease(handle_maMid);
+   IndicatorRelease(handle_maLong);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1. 週末クローズ処理
+   if(GetDayOfWeek() == 5 && GetHour() >= FridayCloseHour)
+   {
+      CloseAllPositions();
+      return;
+   }
+
+   // 2. 季節フィルター（1月・8月停止）
+   if(UseMonthlyFilter)
+   {
+      int currentMonth = GetMonth();
+      if(currentMonth == 1 || currentMonth == 8) return;
+   }
+
+   // 3. 共通エントリー制限
+   if(GetDayOfWeek() == 1 && GetHour() < StartHourMonday) return; 
+   if(PositionsTotal() > 0) return; // MQL5ではOrdersTotalではなくPositionsTotalを使用                         
+   if(GetDailyLossCount() >= MaxLossCountPerDay) return; 
+   if(IsWaitTimeActive(WaitHoursAfterLoss)) return;
+
+   // ----------------------------------------------------------------
+   // ロジック1：1時間足（H1）ベースの判定
+   // ----------------------------------------------------------------
+   ExecuteLogicH1();
+
+   // ----------------------------------------------------------------
+   // ロジック2：30分足（M30）ベースの判定（MTFフィルター付）
+   // ----------------------------------------------------------------
+   ExecuteLogicM30();
+}
+
+//+------------------------------------------------------------------+
+//| ロジック1：1時間足用                                              |
+//+------------------------------------------------------------------+
+void ExecuteLogicH1()
+{
+   double rsi       = GetIndiValue(handle_rsi_h1, 1);
+   double maFast    = GetIndiValue(handle_maFast_h1, 1);
+   double maSlow    = GetIndiValue(handle_maSlow_h1, 1);
+   double maFastPre = GetIndiValue(handle_maFast_h1, 2);
+   double maSlowPre = GetIndiValue(handle_maSlow_h1, 2);
+
+   if(rsi == 0 || maFast == 0) return; // データ取得エラー時はスキップ
+
+   // 買い条件
+   if(maFastPre <= maSlowPre && maFast > maSlow && rsi > 48 && rsi < 62)
+   {
+      ExecuteOrder(ORDER_TYPE_BUY, Lots_H1, "V4_H1_Buy");
+   }
+   // 売り条件
+   if(maFastPre >= maSlowPre && maFast < maSlow && rsi < 52 && rsi > 38)
+   {
+      ExecuteOrder(ORDER_TYPE_SELL, Lots_H1, "V4_H1_Sell");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ロジック2：30分足用（上位足フィルター付）                           |
+//+------------------------------------------------------------------+
+void ExecuteLogicM30()
+{
+   double rsi       = GetIndiValue(handle_rsi_m30, 1);
+   double maFast    = GetIndiValue(handle_maFast_m30, 1);
+   double maSlow    = GetIndiValue(handle_maSlow_m30, 1);
+   double maFastPre = GetIndiValue(handle_maFast_m30, 2);
+   double maSlowPre = GetIndiValue(handle_maSlow_m30, 2);
+
+   double maMid  = GetIndiValue(handle_maMid, 1);
+   double maLong = GetIndiValue(handle_maLong, 1);
+   
+   double priceArray[1];
+   if(CopyClose(_Symbol, PERIOD_M30, 1, 1, priceArray) <= 0) return;
+   double price = priceArray[0];
+
+   if(rsi == 0 || maFast == 0 || maLong == 0) return;
+
+   bool isUpTrend   = (price > maMid && price > maLong);
+   bool isDownTrend = (price < maMid && price < maLong);
+
+   // 買い条件
+   if(maFastPre <= maSlowPre && maFast > maSlow && rsi > 48 && rsi < 62 && isUpTrend)
+   {
+      ExecuteOrder(ORDER_TYPE_BUY, Lots_M30, "V6_M30_Buy");
+   }
+   // 売り条件
+   if(maFastPre >= maSlowPre && maFast < maSlow && rsi < 52 && rsi > 38 && isDownTrend)
+   {
+      ExecuteOrder(ORDER_TYPE_SELL, Lots_M30, "V6_M30_Sell");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 共通補助関数群                                                    |
+//+------------------------------------------------------------------+
+void ExecuteOrder(ENUM_ORDER_TYPE type, double lots, string comment)
+{
+   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl = (type == ORDER_TYPE_BUY) ? price - StopLoss * _Point : price + StopLoss * _Point;
+   double tp = (type == ORDER_TYPE_BUY) ? price + TakeProfit * _Point : price - TakeProfit * _Point;
+   
+   // MQL5のCTradeクラスを使って注文
+   if(type == ORDER_TYPE_BUY)
+      trade.Buy(lots, _Symbol, price, sl, tp, comment);
+   else if(type == ORDER_TYPE_SELL)
+      trade.Sell(lots, _Symbol, price, sl, tp, comment);
+}
+
+int GetDailyLossCount()
+{
+   int count = 0;
+   datetime timeArray[1];
+   if(CopyTime(_Symbol, PERIOD_D1, 0, 1, timeArray) <= 0) return 0;
+   datetime startOfDay = timeArray[0];
+
+   // 今日の履歴を取得
+   if(HistorySelect(startOfDay, TimeCurrent()))
+   {
+      int deals = HistoryDealsTotal();
+      for(int i = 0; i < deals; i++)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         // 決済取引（OUT）のみをカウント
+         if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+         {
+            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+            if(profit < 0) count++;
+         }
+      }
+   }
+   return count;
+}
+
+bool IsWaitTimeActive(int waitHours)
+{
+   if(!HistorySelect(0, TimeCurrent())) return false;
+   
+   int deals = HistoryDealsTotal();
+   // 最新の履歴から遡って探す
+   for(int i = deals - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+      {
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         if(profit < 0)
+         {
+            datetime closeTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+            if(TimeCurrent() < closeTime + (waitHours * 3600)) return true;
+         }
+         break; // 最後の決済のみを確認して抜ける
+      }
+   }
+   return false;
+}
+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0) trade.PositionClose(ticket);
+   }
+}
+
+// インジケーターの値を取得するMQL5用ヘルパー関数
+double GetIndiValue(int handle, int shift)
+{
+   double buffer[1];
+   if(CopyBuffer(handle, 0, shift, 1, buffer) > 0)
+      return buffer[0];
+   return 0.0;
+}
+
+// 時間取得用ヘルパー関数
+int GetDayOfWeek() { MqlDateTime dt; TimeCurrent(dt); return dt.day_of_week; }
+int GetHour() { MqlDateTime dt; TimeCurrent(dt); return dt.hour; }
+int GetMonth() { MqlDateTime dt; TimeCurrent(dt); return dt.mon; }
+//+------------------------------------------------------------------+
